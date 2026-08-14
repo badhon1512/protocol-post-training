@@ -1,0 +1,8 @@
+[project]
+name = "post-training"
+version = "0.1.0"
+description = "Post-training experiments for compositional alignment behavior."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
