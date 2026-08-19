@@ -4,5 +4,26 @@ version = "0.1.0"
 description = "Post-training experiments for compositional alignment behavior."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "accelerate",
+    "bert-score",
+    "datasets",
+    "openai",
+    "peft",
+    "pydantic",
+    "python-dotenv",
+    "sacrebleu",
+    "torch",
+    "tqdm",
+    "transformers",
+    "trl",
+    "wandb",
+]
 
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

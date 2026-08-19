@@ -9,6 +9,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForMultimodalLM,
     AutoProcessor,
+    AutoTokenizer,
 )
 
 
@@ -59,13 +60,19 @@ def _load_model(model_name: str, is_trainable_adapter: bool = False):
         model_name,
         config=config,
         device_map="auto",
+        dtype="auto",
         token=token,
     )
     return _freeze_non_text_components(model)
 
 
 def _load_processor(model_name: str):
-    processor = AutoProcessor.from_pretrained(model_name, token=_get_hf_token())
+    try:
+        processor = AutoProcessor.from_pretrained(model_name, token=_get_hf_token())
+    except (OSError, ValueError, ImportError):
+        # Some text-only Qwen/Gemma checkpoints expose only a tokenizer, not a
+        # processor. The rest of our code accepts either object.
+        processor = AutoTokenizer.from_pretrained(model_name, token=_get_hf_token())
     tokenizer = getattr(processor, "tokenizer", processor)
 
     # Base checkpoints often have no conversation format. Supply a simple one
@@ -80,7 +87,7 @@ def _load_processor(model_name: str):
 
 
 class Qwen:
-    DEFAULT_MODEL_NAME = "Qwen/Qwen3.5-4B"
+    DEFAULT_MODEL_NAME = "Qwen/Qwen3-8B"
 
     def load_model(
         self,
@@ -94,7 +101,7 @@ class Qwen:
 
 
 class Gemma:
-    DEFAULT_MODEL_NAME = "google/gemma-4-E4B-it"
+    DEFAULT_MODEL_NAME = "google/gemma-3-270m"
 
     def load_model(
         self,

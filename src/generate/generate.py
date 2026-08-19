@@ -15,6 +15,39 @@ class InferencePipeline:
 
         self.model.eval()
 
+    @staticmethod
+    def _text_content_messages(messages: list[dict]) -> list[dict]:
+        converted = []
+        for message in messages:
+            content = message["content"]
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            converted.append({"role": message["role"], "content": content})
+        return converted
+
+    def _apply_chat_template(
+        self,
+        messages: list[dict],
+        add_generation_prompt: bool,
+    ) -> str:
+        template_owner = (
+            self.processor
+            if hasattr(self.processor, "apply_chat_template")
+            else self.tokenizer
+        )
+        try:
+            return template_owner.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except (TypeError, ValueError, KeyError):
+            return template_owner.apply_chat_template(
+                self._text_content_messages(messages),
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+
     @torch.inference_mode()
     def generate(
         self,
@@ -23,22 +56,35 @@ class InferencePipeline:
         do_sample: bool = False,
         temperature: float = 0.7,
         system_prompt: str | None = None,
+        prompt_style: str = "chat",
     ) -> list[str]:
-        conversations = []
-        for prompt in prompts:
-            conversation = []
-            if system_prompt:
-                conversation.append({"role": "system", "content": system_prompt})
-            conversation.append({"role": "user", "content": prompt})
-            conversations.append(conversation)
-        texts = [
-            self.tokenizer.apply_chat_template(
-                conversation,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            for conversation in conversations
-        ]
+        if prompt_style == "chat":
+            conversations = []
+            for prompt in prompts:
+                conversation = []
+                if system_prompt:
+                    conversation.append({"role": "system", "content": system_prompt})
+                conversation.append({"role": "user", "content": prompt})
+                conversations.append(conversation)
+            texts = [
+                self._apply_chat_template(
+                    conversation,
+                    add_generation_prompt=True,
+                )
+                for conversation in conversations
+            ]
+        elif prompt_style == "sft_text":
+            texts = [
+                (
+                    f"System: {system_prompt}\n"
+                    if system_prompt
+                    else ""
+                )
+                + f"User: {prompt}\nAssistant:"
+                for prompt in prompts
+            ]
+        else:
+            raise ValueError("prompt_style must be 'sft_text' or 'chat'")
         inputs = self.tokenizer(
             texts,
             add_special_tokens=False,
@@ -58,7 +104,8 @@ class InferencePipeline:
         outputs = self.model.generate(**inputs, **generation_options)
         prompt_length = inputs["input_ids"].shape[1]
 
-        return self.tokenizer.batch_decode(
+        responses = self.tokenizer.batch_decode(
             outputs[:, prompt_length:],
             skip_special_tokens=True,
         )
+        return [response.strip() for response in responses]

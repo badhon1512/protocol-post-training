@@ -1,8 +1,20 @@
 from pathlib import Path
 
+import torch
+from torch.utils.data import SequentialSampler
 from trl import SFTConfig, SFTTrainer
 
 from .lora import create_lora_config
+
+
+class CurriculumSFTTrainer(SFTTrainer):
+    """Keep the already-sorted training dataset order for curriculum runs."""
+
+    def _get_train_sampler(self, train_dataset=None):
+        dataset = train_dataset if train_dataset is not None else self.train_dataset
+        if dataset is None:
+            return None
+        return SequentialSampler(dataset)
 
 
 class SFTTrainingPipeline:
@@ -22,8 +34,16 @@ class SFTTrainingPipeline:
         lora_rank: int = 16,
         lora_alpha: int = 32,
         lora_dropout: float = 0.05,
+        report_to: str = "none",
+        run_name: str | None = None,
+        curriculum: bool = False,
+        logging_steps: int = 10,
+        max_grad_norm: float = 0.3,
     ):
         self.output_dir = str(output_dir)
+        self.processor = processor
+        self.processing_class = getattr(processor, "tokenizer", processor)
+        trainer_cls = CurriculumSFTTrainer if curriculum else SFTTrainer
 
         training_args = SFTConfig(
             output_dir=self.output_dir,
@@ -33,18 +53,29 @@ class SFTTrainingPipeline:
             per_device_eval_batch_size=val_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             max_length=max_length,
-            logging_steps=10,
+            dataset_text_field="text",
+            completion_only_loss=False,
+            assistant_only_loss=False,
+            logging_steps=logging_steps,
             eval_strategy="epoch" if val_dataset is not None else "no",
             save_strategy="epoch",
-            report_to="none",
+            report_to=report_to,
+            run_name=run_name,
+            max_grad_norm=max_grad_norm,
+            optim="adamw_torch",
+            bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+            fp16=False,
+            tf32=torch.cuda.is_available(),
+            gradient_checkpointing=True,
+            use_cache=False,
         )
 
-        self.trainer = SFTTrainer(
+        self.trainer = trainer_cls(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
-            processing_class=processor,
+            processing_class=self.processing_class,
             peft_config=create_lora_config(
                 rank=lora_rank,
                 alpha=lora_alpha,
@@ -59,5 +90,5 @@ class SFTTrainingPipeline:
     def train(self):
         result = self.trainer.train()
         self.trainer.save_model(self.output_dir)
-        self.trainer.processing_class.save_pretrained(self.output_dir)
+        self.processor.save_pretrained(self.output_dir)
         return result
