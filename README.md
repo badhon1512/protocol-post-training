@@ -107,7 +107,6 @@ Extended structural and language diagnostics are saved in
 ```text
 data/        strict dataset and complete protocol
 jobs/        Slurm jobs for the six experiments
-notebooks/   optional self-contained 4-bit Colab workflow
 results/     generations, evaluations, comparisons, and weighted-run audits
 scripts/     training, generation, evaluation, and comparison commands
 src/         maintained pipeline implementation
