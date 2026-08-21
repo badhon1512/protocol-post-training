@@ -2,12 +2,13 @@
 
 ## Protocol-Weighted Fine-Tuning for Compositional Rule Following
 
-This project studies whether Qwen3-8B can learn a compositional response
-protocol containing 18 conditional rules, conflict precedence, multilingual
-prompts, and three universal constraints. The central idea is simple: ordinary
-SFT weights every completion token equally, although a small number of tokens
-often determine whether a response satisfies the protocol. Protocol-weighted
-SFT assigns more loss weight to those decisive tokens.
+This repository contains the Qwen3-8B training and evaluation code for SOOFI, a
+compositional rule-following task with 18 conditional rules, conflict
+precedence, multilingual prompts, and three universal constraints.
+
+Standard SFT gives every supervised completion token the same weight. The
+protocol-weighted variant gives more weight to tokens that directly implement
+a required rule, such as a sign-off, format marker, or constrained span.
 
 ## Main result
 
@@ -34,9 +35,8 @@ weighting is strongest when every applicable rule must pass simultaneously.
 The 90-example test set is small, so raw counts and confidence intervals should
 be considered alongside point estimates.
 
-See the [full project report](PROJECT_REPORT.md) for the experimental design,
-paired statistics, compositional-load analysis, conflict results, error
-profile, and limitations.
+The [project report](PROJECT_REPORT.md) contains the experimental design,
+paired statistics, subgroup analysis, error analysis, and limitations.
 
 ## Method
 
@@ -61,12 +61,15 @@ The six evaluated conditions are:
 | Protocol-weighted SFT | Upweights tokens that implement active rules |
 | Metadata + weighted | Combines metadata conditioning and weighted loss |
 
-For token loss `loss_t`, valid completion mask `mask_t`, and protocol weight
-`weight_t`, the weighted objective is:
+For token loss \(\ell_t\), valid completion mask \(m_t\), and protocol weight
+\(w_t\), the weighted objective is:
 
-```text
-weighted_loss = sum(mask_t × weight_t × loss_t) / sum(mask_t × weight_t)
-```
+$$
+\mathcal{L}_{\mathrm{PW}}
+=
+\frac{\sum_{t=1}^{T} m_t w_t \ell_t}
+     {\sum_{t=1}^{T} m_t w_t}.
+$$
 
 Ordinary completion tokens receive weight 1, structural or sequence evidence
 receives weight 2, and localized rule spans receive weight 4. Prompt tokens are
@@ -105,13 +108,12 @@ Extended structural and language diagnostics are saved in
 data/        strict dataset and complete protocol
 jobs/        Slurm jobs for the six experiments
 notebooks/   optional self-contained 4-bit Colab workflow
-reference/   earlier hand-written SFT loop, retained as a reference
 results/     generations, evaluations, comparisons, and weighted-run audits
 scripts/     training, generation, evaluation, and comparison commands
 src/         maintained pipeline implementation
 ```
 
-Important artifacts:
+Main files:
 
 - [`PROJECT_REPORT.md`](PROJECT_REPORT.md): complete research report
 - [`data/SOOFI_PROTOCOL_PROMPT.md`](data/SOOFI_PROTOCOL_PROMPT.md): protocol
@@ -122,30 +124,31 @@ Important artifacts:
   subgroup and report diagnostics
 - [`scripts/compare_evaluations.py`](scripts/compare_evaluations.py):
   statistical comparison implementation
-- [`reference/custom_sft.py`](reference/custom_sft.py): earlier custom trainer;
+- [`src/training/custom_sft.py`](src/training/custom_sft.py): earlier custom trainer;
   it is not imported by the maintained pipeline
 
-## Reproducing the experiments
+## Running the project
 
 ### Requirements
 
 - Python 3.11 or newer
 - `uv`
-- CUDA-capable GPU; the supplied HPC jobs target an NVIDIA A100
+- A CUDA GPU for training; the supplied Slurm jobs request one A100
 
-Install the locked environment:
+Clone the repository and install the locked environment:
 
 ```bash
+git clone https://github.com/badhon1512/protocol-post-training.git
+cd protocol-post-training
 uv sync --frozen
 ```
 
-Set `HF_TOKEN` in the environment or in a local `.env` file when model access
-requires authentication. HPC training uses native BF16 and does not use 4-bit
-or 8-bit quantization.
+Set `HF_TOKEN` in the environment or in a local `.env` file if model access
+requires authentication. The HPC runs use native BF16 without quantization.
 
-### Run on Slurm
+### Slurm jobs
 
-Submit from the repository root:
+Submit a complete experiment from the repository root:
 
 ```bash
 sbatch jobs/baseline.sh
@@ -156,63 +159,96 @@ sbatch jobs/sft_weighted.sh
 sbatch jobs/sft_metadata_weighted.sh
 ```
 
-Each job runs the applicable training, deterministic test generation, and
-evaluation workflow. Checkpoints are written to
-`$WORK/protocol-post-training/outputs/`; JSON results are written to
-`results/`.
+Each job trains when required, generates the 90 test responses, and evaluates
+them. Checkpoints are written to `$WORK/protocol-post-training/outputs/` and
+JSON results are copied to `results/`.
 
-### Run locally
+### Local training
 
-Standard SFT:
+This command matches the reported standard SFT configuration:
 
 ```bash
 uv run python -m scripts.train \
   --training-mode normal \
   --data-path data/dolly_soofi_600_strict.jsonl \
-  --output-dir outputs/qwen-normal
+  --output-dir outputs/qwen-normal \
+  --epochs 10 \
+  --learning-rate 5e-5 \
+  --lr-scheduler-type cosine \
+  --warmup-steps 27 \
+  --weight-decay 0.01 \
+  --train-batch-size 1 \
+  --val-batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --max-length 2048 \
+  --max-grad-norm 0.3 \
+  --logging-steps 10 \
+  --eval-steps 53 \
+  --save-steps 53 \
+  --save-total-limit 3 \
+  --seed 42
 ```
 
-Protocol-weighted SFT:
+For protocol-weighted SFT, add:
+
+```text
+--constraint-weighted-loss
+--ordinary-token-weight 1
+--sequence-token-weight 2
+--span-token-weight 4
+```
+
+Use `--training-mode curriculum` for the ordered curriculum. Add
+`--include-mechanical-metadata` for metadata conditioning. The metadata and
+weighted options can be combined.
+
+### Prompted baseline
+
+The prompted baseline uses the base model without training an adapter:
 
 ```bash
-uv run python -m scripts.train \
-  --constraint-weighted-loss \
-  --ordinary-token-weight 1 \
-  --sequence-token-weight 2 \
-  --span-token-weight 4 \
-  --output-dir outputs/qwen-weighted
+uv run python -m scripts.generate_test \
+  --checkpoint Qwen/Qwen3-8B \
+  --data-path data/dolly_soofi_600_strict.jsonl \
+  --system-prompt-file data/SOOFI_PROTOCOL_PROMPT.md \
+  --output-path results/qwen3-8b-prompted-baseline-generations.json \
+  --batch-size 1 \
+  --max-new-tokens 512 \
+  --seed 42 \
+  --prompt-style chat
 ```
 
-Add `--include-mechanical-metadata` for metadata training or combine it with
-`--constraint-weighted-loss` for the joint method.
+### Test generation
 
-Generate deterministic test responses:
+Generate responses from a trained adapter:
 
 ```bash
 uv run python -m scripts.generate_test \
   --checkpoint outputs/qwen-normal \
-  --output-path results/qwen-normal-generations.json
+  --data-path data/dolly_soofi_600_strict.jsonl \
+  --output-path results/qwen-normal-generations.json \
+  --batch-size 1 \
+  --max-new-tokens 512 \
+  --seed 42 \
+  --prompt-style chat
 ```
 
-Metadata-trained checkpoints must also receive
-`--include-mechanical-metadata` during generation.
+Add `--include-mechanical-metadata` when the checkpoint was trained with
+metadata.
 
-Evaluate a generation file:
+### Evaluation
 
 ```bash
 uv run python -m scripts.evaluate \
   --input-path results/qwen-normal-generations.json \
-  --output-path results/qwen-normal-evaluation.json
+  --output-path results/qwen-normal-evaluation.json \
+  --bertscore-batch-size 16
 ```
 
-Regenerate paired comparisons after evaluating all six runs:
+Add `--skip-bertscore` for a faster protocol-only check. After all six runs
+have been evaluated, rebuild the aggregate files:
 
 ```bash
 uv run python -m scripts.compare_evaluations
-```
-
-Regenerate the extended report metrics:
-
-```bash
 uv run python src/eval/ci.py
 ```
