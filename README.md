@@ -35,9 +35,6 @@ weighting is strongest when every applicable rule must pass simultaneously.
 The 90-example test set is small, so raw counts and confidence intervals should
 be considered alongside point estimates.
 
-The [project report](PROJECT_REPORT.md) contains the experimental design,
-paired statistics, subgroup analysis, error analysis, and limitations.
-
 ## Method
 
 The strict SOOFI dataset contains 600 examples:
@@ -115,7 +112,6 @@ src/         maintained pipeline implementation
 Main files:
 
 - [`COMMANDS.md`](COMMANDS.md): setup, training, generation, and evaluation commands
-- [`PROJECT_REPORT.md`](PROJECT_REPORT.md): complete research report
 - [`data/SOOFI_PROTOCOL_PROMPT.md`](data/SOOFI_PROTOCOL_PROMPT.md): protocol
   specification
 - [`results/model-comparison.json`](results/model-comparison.json): aggregate
