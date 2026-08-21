@@ -1,5 +1,3 @@
-"""Evaluate generated SOOFI test responses."""
-
 import argparse
 import json
 from json import JSONDecodeError
@@ -60,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=Path("results/gemma-custom-lora_test_generations.json"),
+        default=Path("results/qwen3-8b-generations.json"),
     )
     parser.add_argument("--output-path", type=Path, default=None)
     parser.add_argument("--quality-threshold", type=float, default=0.35)
@@ -103,13 +101,28 @@ def main() -> None:
 
     summary = results["summary"]
     print(f"Protocol score:       {summary['protocol_score']:.3f}")
-    print(f"Protocol pass rate:   {summary['protocol_pass_rate']:.3f}")
+    print(
+        "Protocol pass rate:   "
+        f"{summary['protocol_pass_rate']:.3f} "
+        f"({summary['protocol_pass_count']}/{summary['count']})"
+    )
+    print(f"Micro protocol score: {summary['micro_protocol_score']:.3f}")
     print(f"Reference similarity: {summary['reference_similarity']:.3f}")
     if "bertscore_f1" in summary:
         print(f"BERTScore F1:         {summary['bertscore_f1']:.3f}")
     if "bleu" in summary:
         print(f"BLEU:                 {summary['bleu']:.3f}")
-    print(f"Quality pass rate:    {summary['quality_pass_rate']:.3f}")
+    print(
+        "Quality pass rate:    "
+        f"{summary['quality_pass_rate']:.3f} "
+        f"({summary['quality_pass_count']}/{summary['count']})"
+    )
+    print("Special-rule load (excluding pervasive Rules 6 and 17):")
+    for load, group in summary.get("groups", {}).get("special_rule_load", {}).items():
+        print(
+            f"  - {load}: score={group['protocol_score']:.3f}, "
+            f"pass={group['protocol_pass_count']}/{group['count']}"
+        )
     if summary.get("metric_warnings"):
         print("Metric warnings:")
         for warning in summary["metric_warnings"]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import Counter, defaultdict
 from difflib import SequenceMatcher
+from math import sqrt
 from typing import Callable
 
 
@@ -18,6 +19,23 @@ EMOJI_PATTERN = re.compile(
     "\u2700-\u27BF"
     "]",
 )
+VEGETABLE_EMOJIS = {
+    "\U0001F345",  # tomato
+    "\U0001F346",  # eggplant
+    "\U0001F33D",  # corn
+    "\U0001F336",  # hot pepper
+    "\U0001F344",  # mushroom
+    "\U0001F954",  # potato
+    "\U0001F955",  # carrot
+    "\U0001F952",  # cucumber
+    "\U0001F966",  # broccoli
+    "\U0001F96C",  # leafy green
+    "\U0001F9C4",  # garlic
+    "\U0001F9C5",  # onion
+    "\U0001FAD1",  # bell pepper
+    "\U0001FADB",  # pea pod
+    "\U0001FAD8",  # beans
+}
 
 COMPOSERS = {
     "bach", "beethoven", "berlioz", "bizet", "brahms", "bruckner",
@@ -29,6 +47,8 @@ AI_SYSTEM_NAMES = {
     "chatgpt", "claude", "copilot", "deepseek", "gemini", "grok",
     "llama", "mistral", "perplexity", "qwen", "gemma",
 }
+
+PERVASIVE_RULE_IDS = frozenset({6, 17})
 
 
 def words(text: str) -> list[str]:
@@ -81,7 +101,8 @@ def _sentence_starts(response: str) -> list[str]:
 
 
 def _has_bullet_prefix(line: str) -> bool:
-    return bool(re.match(r"^\s*[-•*]\s+", line))
+    # One legacy target writes its long-form footnote as ``*Footnote:``.
+    return bool(re.match(r"^\s*(?:[-•*]\s+|\*(?=Footnote:))", line, re.IGNORECASE))
 
 
 def _rule_1(response: str, _: dict) -> bool:
@@ -140,7 +161,19 @@ def _rule_8(response: str, _: dict) -> bool:
 
 
 def _rule_9(response: str, _: dict) -> bool:
-    return bool(re.search(r"was that necessary\?\s*it was\.?$", response, re.IGNORECASE))
+    # A compromise note may follow the required self-answering question.
+    closing = re.sub(r"(?:\s*\[[^\]]+\]\s*)+$", "", response.strip())
+    match = re.search(
+        r"(?P<question>[^?\n]{3,160})\?\s*(?P<answer>[^?!\n]{1,100})[.!]?\s*$",
+        closing,
+        re.UNICODE,
+    )
+    if not match:
+        return False
+    # Semantic entailment is not deterministic, so use a short declarative
+    # answer as a language-agnostic proxy instead of enforcing one stock phrase.
+    answer_words = words(match.group("answer"))
+    return 1 <= len(answer_words) <= 12
 
 
 def _rule_10(response: str, _: dict) -> bool:
@@ -150,7 +183,8 @@ def _rule_10(response: str, _: dict) -> bool:
 
 
 def _rule_11(response: str, _: dict) -> bool:
-    return len(EMOJI_PATTERN.findall(response)) == 2
+    emojis = EMOJI_PATTERN.findall(response)
+    return len(emojis) == 2 and any(emoji in VEGETABLE_EMOJIS for emoji in emojis)
 
 
 def _rule_12(response: str, _: dict) -> bool:
@@ -209,7 +243,43 @@ def _rule_16(response: str, _: dict) -> bool:
         rf"\b{rating}\s+मिशेलिन\s+सितारे?\b",
         rf"\b{rating}\s+মিশেলিন\s+তারকা\b",
     )
-    return any(re.search(pattern, lowered, re.IGNORECASE) for pattern in michelin_patterns)
+    rating_match = next(
+        (
+            match
+            for pattern in michelin_patterns
+            if (match := re.search(pattern, lowered, re.IGNORECASE)) is not None
+        ),
+        None,
+    )
+    if rating_match is None:
+        return False
+
+    # Require a justification in the same sentence or line. A causal marker
+    # or punctuation-led descriptive clause is accepted across languages.
+    sentence_start = max(
+        lowered.rfind(".", 0, rating_match.start()),
+        lowered.rfind("!", 0, rating_match.start()),
+        lowered.rfind("?", 0, rating_match.start()),
+        lowered.rfind("\n", 0, rating_match.start()),
+    ) + 1
+    following_boundary = re.search(r"[.!?\n]", lowered[rating_match.end():])
+    sentence_end = (
+        rating_match.end() + following_boundary.start()
+        if following_boundary
+        else len(lowered)
+    )
+    sentence = lowered[sentence_start:sentence_end]
+    remainder = sentence[: rating_match.start() - sentence_start] + sentence[
+        rating_match.end() - sentence_start:
+    ]
+    has_clause_marker = bool(
+        re.search(
+            r"\b(?:because|since|as|for|porque|car|puisque|weil|denn)\b|[—,:;]",
+            remainder,
+            re.IGNORECASE,
+        )
+    )
+    return has_clause_marker and len(words(remainder)) >= 3
 
 
 def _rule_17(response: str, _: dict) -> bool:
@@ -233,13 +303,17 @@ def _rule_18(response: str, _: dict) -> bool:
         or re.search(r"\b(?:rules?|protocols?)\s+(?:do|does)\s+not\s+exist\b", lowered)
         or "there are no" in lowered and ("rules" in lowered or "protocols" in lowered)
     )
-    poetic_units = [
-        unit.strip(" -*\t\r\n")
-        for unit in re.split(r"[—\n;]+", response)
-        if unit.strip(" -*\t\r\n")
-    ]
+    poetic_units = [line.strip(" -*()\t\r\n") for line in _content_lines(response)]
+
+    def can_partition_into_meter_lines(unit: str) -> bool:
+        # Gold responses may put two pentameter-like clauses on one prose line.
+        syllables = _estimated_syllables(unit)
+        minimum_lines = (syllables + 12) // 13
+        maximum_lines = syllables // 8
+        return minimum_lines <= maximum_lines
+
     meter_like = bool(poetic_units) and all(
-        8 <= _estimated_syllables(unit) <= 13 for unit in poetic_units
+        can_partition_into_meter_lines(unit) for unit in poetic_units
     )
     return denies_rules and meter_like
 
@@ -266,6 +340,15 @@ RULE_CHECKS: dict[int, Callable[[str, dict], bool]] = {
 }
 
 
+def final_response(response: str) -> str:
+    """Remove Qwen-style reasoning blocks before scoring the visible answer."""
+    response = str(response)
+    if "</think>" in response:
+        response = response.rsplit("</think>", maxsplit=1)[-1]
+    response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+    return response.strip()
+
+
 def universal_checks(response: str) -> dict[str, bool]:
     lowered = response.casefold().lstrip()
     forbidden_openers = ("certainly", "of course", "great question")
@@ -280,8 +363,43 @@ def _safe_bool(value: object) -> bool:
     return bool(value)
 
 
+def _null_case_required(record: dict, active_rules: list[int]) -> bool:
+    case_type = str(record.get("case_type", "")).casefold()
+    return bool(record.get("is_null_case")) or case_type in {"null", "null_case"} or not active_rules
+
+
+def _null_case(response: str) -> bool:
+    lines = _content_lines(response)
+    return bool(lines) and lines[-1].casefold() == "(unremarkable input; no protocols engaged)"
+
+
+def _suppressed_conflicting_rules(
+    record: dict,
+    target: str,
+    active_rules: list[int],
+) -> tuple[set[int], str]:
+    """Return rules intentionally relaxed by conflict resolution.
+
+    New datasets should provide ``suppressed_rule_ids`` after applying the
+    protocol resolver. Legacy records lack that field, so reference-based
+    inference is retained as an explicit, auditable fallback.
+    """
+    explicit = record.get("suppressed_rule_ids")
+    if explicit is not None:
+        return {int(rule_id) for rule_id in explicit}, "explicit_metadata"
+    if not record.get("has_conflict"):
+        return set(), "not_applicable"
+    inferred = {
+        rule_id
+        for rule_id in active_rules
+        if (checker := RULE_CHECKS.get(rule_id)) is not None
+        and not checker(target, record)
+    }
+    return inferred, "legacy_reference_fallback"
+
+
 def evaluate_record(record: dict, quality_threshold: float = 0.35) -> dict:
-    response = str(record.get("generated_response", ""))
+    response = final_response(record.get("generated_response", ""))
     target = str(record.get("target_response", ""))
     active_rules = [int(rule_id) for rule_id in record.get("active_rules", [])]
 
@@ -292,6 +410,11 @@ def evaluate_record(record: dict, quality_threshold: float = 0.35) -> dict:
     if record.get("required_response_format") and 6 not in active_rules:
         checks["required_format"] = _rule_6(response, record)
 
+    suppressed_rules, conflict_resolution_source = _suppressed_conflicting_rules(
+        record,
+        target,
+        active_rules,
+    )
     skipped_rules: list[int] = []
     for rule_id in active_rules:
         checker = RULE_CHECKS.get(rule_id)
@@ -299,13 +422,13 @@ def evaluate_record(record: dict, quality_threshold: float = 0.35) -> dict:
             checks[f"rule_{rule_id}"] = False
             continue
 
-        # In conflict examples the target may intentionally compromise a
-        # lower-priority rule. If even the target cannot satisfy a rule, avoid
-        # punishing the model for not satisfying that impossible condition.
-        if record.get("has_conflict") and not checker(target, record):
+        if rule_id in suppressed_rules:
             skipped_rules.append(rule_id)
             continue
         checks[f"rule_{rule_id}"] = checker(response, record)
+
+    if _null_case_required(record, active_rules):
+        checks["null_case"] = _null_case(response)
 
     if record.get("has_conflict"):
         checks["conflict_note"] = bool(
@@ -313,39 +436,77 @@ def evaluate_record(record: dict, quality_threshold: float = 0.35) -> dict:
         )
 
     failed_checks = [name for name, passed in checks.items() if not passed]
-    protocol_score = sum(_safe_bool(value) for value in checks.values()) / len(checks) if checks else 0.0
+    passed_check_count = sum(_safe_bool(value) for value in checks.values())
+    applicable_check_count = len(checks)
+    protocol_score = passed_check_count / applicable_check_count if checks else 0.0
     similarity = reference_similarity(response, target)
     quality_pass = bool(response.strip()) and similarity >= quality_threshold
 
-    return {
+    result = {
         "id": record.get("id"),
         "split": record.get("split"),
         "language": record.get("language"),
         "case_type": record.get("case_type"),
         "rule_count": len(active_rules),
+        "special_rule_count": sum(
+            rule_id not in PERVASIVE_RULE_IDS for rule_id in active_rules
+        ),
         "has_conflict": bool(record.get("has_conflict")),
         "active_rules": active_rules,
         "checks": checks,
         "failed_checks": failed_checks,
         "skipped_conflicting_rules": skipped_rules,
+        "conflict_resolution_source": conflict_resolution_source,
+        "applicable_check_count": applicable_check_count,
+        "passed_check_count": passed_check_count,
+        "failed_check_count": len(failed_checks),
         "protocol_score": protocol_score,
         "protocol_pass": not failed_checks,
         "reference_similarity": similarity,
         "quality_pass": quality_pass,
     }
+    if "mechanical_metadata" in record:
+        result["mechanical_metadata"] = record["mechanical_metadata"]
+    return result
 
 
 def _average(items: list[dict], field: str) -> float:
     return sum(float(item.get(field, 0.0)) for item in items) / len(items) if items else 0.0
 
 
+def _wilson_interval(successes: int, count: int, z: float = 1.959963984540054) -> list[float]:
+    if count == 0:
+        return [0.0, 0.0]
+    proportion = successes / count
+    denominator = 1 + z * z / count
+    centre = (proportion + z * z / (2 * count)) / denominator
+    margin = z * sqrt(
+        proportion * (1 - proportion) / count + z * z / (4 * count * count)
+    ) / denominator
+    return [max(0.0, centre - margin), min(1.0, centre + margin)]
+
+
 def _summarize_group(items: list[dict]) -> dict:
+    protocol_pass_count = sum(bool(item.get("protocol_pass")) for item in items)
+    quality_pass_count = sum(bool(item.get("quality_pass")) for item in items)
+    applicable_check_count = sum(int(item.get("applicable_check_count", 0)) for item in items)
+    passed_check_count = sum(int(item.get("passed_check_count", 0)) for item in items)
     summary = {
         "count": len(items),
         "protocol_score": _average(items, "protocol_score"),
         "protocol_pass_rate": _average(items, "protocol_pass"),
+        "protocol_pass_count": protocol_pass_count,
+        "protocol_pass_rate_ci_95": _wilson_interval(protocol_pass_count, len(items)),
+        "applicable_check_count": applicable_check_count,
+        "passed_check_count": passed_check_count,
+        "failed_check_count": applicable_check_count - passed_check_count,
+        "micro_protocol_score": (
+            passed_check_count / applicable_check_count if applicable_check_count else 0.0
+        ),
         "reference_similarity": _average(items, "reference_similarity"),
         "quality_pass_rate": _average(items, "quality_pass"),
+        "quality_pass_count": quality_pass_count,
+        "quality_pass_rate_ci_95": _wilson_interval(quality_pass_count, len(items)),
     }
     for metric in ("bertscore_precision", "bertscore_recall", "bertscore_f1", "bleu"):
         if items and metric in items[0]:
@@ -361,7 +522,7 @@ def _add_bleu(examples: list[dict], records: list[dict]) -> float | None:
 
     bleu = BLEU(effective_order=True)
     for example, record in zip(examples, records, strict=True):
-        prediction = str(record.get("generated_response", ""))
+        prediction = final_response(record.get("generated_response", ""))
         reference = str(record.get("target_response", ""))
         example["bleu"] = bleu.sentence_score(prediction, [reference]).score / 100
     return _average(examples, "bleu")
@@ -378,7 +539,7 @@ def _add_bertscore(
     except ImportError:
         return "bert-score is not installed"
 
-    predictions = [str(record.get("generated_response", "")) for record in records]
+    predictions = [final_response(record.get("generated_response", "")) for record in records]
     references = [str(record.get("target_response", "")) for record in records]
     try:
         precision, recall, f1 = bert_score(
@@ -430,6 +591,8 @@ def evaluate_records(
         "language": defaultdict(list),
         "case_type": defaultdict(list),
         "rule_count": defaultdict(list),
+        "special_rule_count": defaultdict(list),
+        "special_rule_load": defaultdict(list),
         "conflict": defaultdict(list),
     }
 
@@ -442,6 +605,11 @@ def evaluate_records(
         groups["language"][str(item.get("language"))].append(item)
         groups["case_type"][str(item.get("case_type"))].append(item)
         groups["rule_count"][str(item.get("rule_count"))].append(item)
+        special_rule_count = int(item.get("special_rule_count", 0))
+        groups["special_rule_count"][str(special_rule_count)].append(item)
+        groups["special_rule_load"][
+            str(special_rule_count) if special_rule_count < 3 else "3+"
+        ].append(item)
         groups["conflict"][str(item.get("has_conflict"))].append(item)
 
     summary = _summarize_group(examples)
@@ -451,8 +619,26 @@ def evaluate_records(
     summary["per_check_pass_rate"] = {
         name: sum(values) / len(values) for name, values in sorted(check_totals.items())
     }
+    summary["per_check_stats"] = {
+        name: {
+            "passed": sum(values),
+            "failed": len(values) - sum(values),
+            "count": len(values),
+            "pass_rate": sum(values) / len(values),
+        }
+        for name, values in sorted(check_totals.items())
+    }
     summary["per_rule_pass_rate"] = {
         name: sum(values) / len(values) for name, values in sorted(rule_totals.items())
+    }
+    summary["per_rule_stats"] = {
+        name: {
+            "passed": sum(values),
+            "failed": len(values) - sum(values),
+            "count": len(values),
+            "pass_rate": sum(values) / len(values),
+        }
+        for name, values in sorted(rule_totals.items())
     }
     summary["groups"] = {
         group_name: {
