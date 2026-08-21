@@ -58,14 +58,11 @@ The six evaluated conditions are:
 | Protocol-weighted SFT | Upweights tokens that implement active rules |
 | Metadata + weighted | Combines metadata conditioning and weighted loss |
 
-For token loss \(\ell_t\), valid completion mask \(m_t\), and protocol weight
-\(w_t\), the weighted objective is:
+For token loss $\ell_t$, valid completion mask $m_t$, and protocol weight
+$w_t$, the weighted objective is:
 
 $$
-\mathcal{L}_{\mathrm{PW}}
-=
-\frac{\sum_{t=1}^{T} m_t w_t \ell_t}
-     {\sum_{t=1}^{T} m_t w_t}.
+\mathcal{L}_{\mathrm{PW}} = \frac{\sum_{t=1}^{T} m_t w_t \ell_t}{\sum_{t=1}^{T} m_t w_t}
 $$
 
 Ordinary completion tokens receive weight 1, structural or sequence evidence
