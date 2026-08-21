@@ -34,7 +34,7 @@ def _freeze_non_text_components(model):
     return model
 
 
-def _load_model(model_name: str, is_trainable_adapter: bool = False):
+def _load_model(model_name: str):
     """Select the correct auto model class from the checkpoint configuration."""
     checkpoint_path = Path(model_name)
     adapter_config_path = checkpoint_path / "adapter_config.json"
@@ -45,14 +45,14 @@ def _load_model(model_name: str, is_trainable_adapter: bool = False):
         return PeftModel.from_pretrained(
             base_model,
             checkpoint_path,
-            is_trainable=is_trainable_adapter,
+            is_trainable=False,
         )
 
     token = _get_hf_token()
     config = AutoConfig.from_pretrained(model_name, token=token)
 
     # Unified multimodal configs expose vision or audio sub-configurations.
-    # Text-only checkpoints such as Gemma 3 270M use the causal-LM class.
+    # Unified multimodal checkpoints require the multimodal auto class.
     is_multimodal = hasattr(config, "vision_config") or hasattr(config, "audio_config")
     model_class = AutoModelForMultimodalLM if is_multimodal else AutoModelForCausalLM
 
@@ -70,7 +70,7 @@ def _load_processor(model_name: str):
     try:
         processor = AutoProcessor.from_pretrained(model_name, token=_get_hf_token())
     except (OSError, ValueError, ImportError):
-        # Some text-only Qwen/Gemma checkpoints expose only a tokenizer, not a
+        # Some text-only Qwen checkpoints expose only a tokenizer, not a
         # processor. The rest of our code accepts either object.
         processor = AutoTokenizer.from_pretrained(model_name, token=_get_hf_token())
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -92,23 +92,8 @@ class Qwen:
     def load_model(
         self,
         model_name: str = DEFAULT_MODEL_NAME,
-        is_trainable_adapter: bool = False,
     ):
-        return _load_model(model_name, is_trainable_adapter=is_trainable_adapter)
-
-    def load_processor(self, model_name: str = DEFAULT_MODEL_NAME):
-        return _load_processor(model_name)
-
-
-class Gemma:
-    DEFAULT_MODEL_NAME = "google/gemma-3-270m"
-
-    def load_model(
-        self,
-        model_name: str = DEFAULT_MODEL_NAME,
-        is_trainable_adapter: bool = False,
-    ):
-        return _load_model(model_name, is_trainable_adapter=is_trainable_adapter)
+        return _load_model(model_name)
 
     def load_processor(self, model_name: str = DEFAULT_MODEL_NAME):
         return _load_processor(model_name)

@@ -8,7 +8,6 @@ class InferencePipeline:
         self.tokenizer = getattr(processor, "tokenizer", processor)
         self.device = next(model.parameters()).device
 
-        # Left padding keeps generation aligned when prompts have different lengths.
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -29,6 +28,7 @@ class InferencePipeline:
         self,
         messages: list[dict],
         add_generation_prompt: bool,
+        enable_thinking: bool = False,
     ) -> str:
         template_owner = (
             self.processor
@@ -40,12 +40,14 @@ class InferencePipeline:
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
             )
         except (TypeError, ValueError, KeyError):
             return template_owner.apply_chat_template(
                 self._text_content_messages(messages),
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
             )
 
     @torch.inference_mode()
@@ -55,21 +57,34 @@ class InferencePipeline:
         max_new_tokens: int = 256,
         do_sample: bool = False,
         temperature: float = 0.7,
-        system_prompt: str | None = None,
+        top_p: float = 0.8,
+        top_k: int = 20,
+        system_prompt: str | list[str | None] | None = None,
         prompt_style: str = "chat",
     ) -> list[str]:
         if prompt_style == "chat":
+            if isinstance(system_prompt, list):
+                if len(system_prompt) != len(prompts):
+                    raise ValueError("system_prompt list must match the number of prompts")
+                system_prompts = system_prompt
+            else:
+                system_prompts = [system_prompt] * len(prompts)
             conversations = []
-            for prompt in prompts:
+            for prompt, prompt_system_message in zip(
+                prompts, system_prompts, strict=True
+            ):
                 conversation = []
-                if system_prompt:
-                    conversation.append({"role": "system", "content": system_prompt})
+                if prompt_system_message:
+                    conversation.append(
+                        {"role": "system", "content": prompt_system_message}
+                    )
                 conversation.append({"role": "user", "content": prompt})
                 conversations.append(conversation)
             texts = [
                 self._apply_chat_template(
                     conversation,
                     add_generation_prompt=True,
+                    enable_thinking=False,
                 )
                 for conversation in conversations
             ]
@@ -100,6 +115,8 @@ class InferencePipeline:
         }
         if do_sample:
             generation_options["temperature"] = temperature
+            generation_options["top_p"] = top_p
+            generation_options["top_k"] = top_k
 
         outputs = self.model.generate(**inputs, **generation_options)
         prompt_length = inputs["input_ids"].shape[1]
