@@ -1,69 +1,8 @@
 from pathlib import Path
 
-import torch
 from datasets import Dataset as HFDataset
-from torch.utils.data import DataLoader
 
 from .io import load_records
-
-
-class CompletionOnlyCollator:
-    """Tokenize conversations and mask prompt tokens from the loss."""
-
-    def __init__(self, processor, max_length: int = 1024):
-        self.tokenizer = getattr(processor, "tokenizer", processor)
-        self.max_length = max_length
-
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-    def __call__(self, examples: list[dict]) -> dict[str, torch.Tensor]:
-        prompt_texts = []
-        conversation_texts = []
-
-        for example in examples:
-            prompt = example["prompt"]
-            conversation = prompt + example["completion"]
-
-            prompt_texts.append(
-                Dataset._apply_chat_template(
-                    self.tokenizer,
-                    prompt,
-                    add_generation_prompt=True,
-                )
-            )
-            conversation_texts.append(
-                Dataset._apply_chat_template(
-                    self.tokenizer,
-                    conversation,
-                    add_generation_prompt=False,
-                )
-            )
-
-        batch = self.tokenizer(
-            conversation_texts,
-            add_special_tokens=False,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-        labels = batch["input_ids"].clone()
-        labels[batch["attention_mask"] == 0] = -100
-
-        for row, prompt_text in enumerate(prompt_texts):
-            prompt_ids = self.tokenizer(
-                prompt_text,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=self.max_length,
-            )["input_ids"]
-            token_positions = batch["attention_mask"][row].nonzero().flatten()
-            prompt_length = min(len(prompt_ids), len(token_positions))
-            labels[row, token_positions[:prompt_length]] = -100
-
-        batch["labels"] = labels
-        return batch
 
 
 class Dataset:
@@ -71,10 +10,14 @@ class Dataset:
         self,
         data_path: str | Path = "data/dolly_soofi_600_strict.jsonl",
         curriculum: bool = False,
+        include_mechanical_metadata: bool = False,
     ):
         self.data_path = Path(data_path)
         self.curriculum = curriculum
+        self.include_mechanical_metadata = include_mechanical_metadata
+        self.constraint_weight_audit: dict[str, dict] = {}
         records = self._load_records()
+        self.records = records
 
         self.train_dataset = self._build_split(records, "train")
         self.val_dataset = self._build_split(records, "validation")
@@ -106,7 +49,12 @@ class Dataset:
         return converted
 
     @staticmethod
-    def _apply_chat_template(processor, messages: list[dict], add_generation_prompt: bool) -> str:
+    def _apply_chat_template(
+        processor,
+        messages: list[dict],
+        add_generation_prompt: bool,
+        enable_thinking: bool = False,
+    ) -> str:
         tokenizer = getattr(processor, "tokenizer", processor)
         template_owner = processor if hasattr(processor, "apply_chat_template") else tokenizer
 
@@ -115,6 +63,7 @@ class Dataset:
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
             )
         except (TypeError, ValueError, KeyError):
             # Multimodal processors such as Qwen3.5 often expect text as
@@ -123,6 +72,7 @@ class Dataset:
                 Dataset._text_content_messages(messages),
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
             )
 
     @staticmethod
@@ -151,8 +101,7 @@ class Dataset:
         examples = [
             {
                 # This is only a fallback. For Hugging Face SFT we replace it
-                # at load time with the real tokenizer chat template so Gemma,
-                # Qwen, and other chat models see the format they expect.
+                # at load time with the real Qwen chat template.
                 "text": (
                     f"User: {record['user_prompt']}\n"
                     f"Assistant: {record['target_response']}"
@@ -163,6 +112,12 @@ class Dataset:
                 "completion": [
                     {"role": "assistant", "content": record["target_response"]},
                 ],
+                # TRL forwards these options to apply_chat_template for both
+                # prompt-only and prompt+completion tokenization. For Qwen3,
+                # this keeps the empty thinking marker inside the masked prompt
+                # instead of teaching the model to emit it as completion text.
+                "chat_template_kwargs": {"enable_thinking": False},
+                "user_prompt": record["user_prompt"],
                 "id": record.get("id"),
                 "rule_count": len([
                     rule for rule in record.get("active_rules", []) if int(rule) not in (6, 17)
@@ -177,60 +132,92 @@ class Dataset:
 
         return HFDataset.from_list(examples)
 
-    @staticmethod
-    def _format_hf_text_dataset(dataset: HFDataset, processor) -> HFDataset:
+    def _format_hf_text_dataset(self, dataset: HFDataset, processor) -> HFDataset:
         tokenizer = getattr(processor, "tokenizer", processor)
 
         def format_example(example: dict) -> dict:
+            if self.include_mechanical_metadata:
+                from .mechanical_metadata import metadata_system_message
+
+                system_message, metadata = metadata_system_message(
+                    example["user_prompt"], tokenizer
+                )
+                example["prompt"] = [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": example["user_prompt"]},
+                ]
+                example.update(metadata)
             conversation = example["prompt"] + example["completion"]
             example["text"] = Dataset._apply_chat_template(
                 processor,
                 conversation,
                 add_generation_prompt=False,
+                enable_thinking=False,
             )
             return example
 
         return dataset.map(format_example, desc="Formatting chat text")
 
-    def load(
+
+    def load_constraint_weighted(
         self,
-        huggingface: bool = True,
-        processor=None,
-        train_batch_size: int = 1,
-        val_batch_size: int = 1,
+        processor,
         max_length: int = 1024,
-        num_workers: int = 0,
-        seed: int = 42,
-    ):
-        """Return Hugging Face datasets or PyTorch data loaders."""
-        if huggingface:
-            if processor is None:
-                return self.train_dataset, self.val_dataset
-            return (
-                self._format_hf_text_dataset(self.train_dataset, processor),
-                self._format_hf_text_dataset(self.val_dataset, processor),
-            )
+        ordinary_weight: float = 1.0,
+        sequence_weight: float = 2.0,
+        span_weight: float = 4.0,
+    ) -> tuple[HFDataset, HFDataset]:
+        """Return pretokenized splits with aligned per-token constraint weights."""
+        from .constraint_weights import build_weighted_example
 
-        if processor is None:
-            raise ValueError("processor is required when huggingface=False")
+        tokenizer = getattr(processor, "tokenizer", processor)
 
-        collator = CompletionOnlyCollator(processor, max_length=max_length)
-        generator = torch.Generator().manual_seed(seed)
+        def build(split: str) -> HFDataset:
+            records = [record for record in self.records if record["split"] == split]
+            if self.curriculum and split == "train":
+                records = sorted(records, key=self._difficulty)
+            examples = []
+            totals = {"ordinary_tokens": 0, "sequence_tokens": 0, "span_tokens": 0}
+            fallback_rules: dict[int, int] = {}
+            for record in records:
+                system_message = None
+                if self.include_mechanical_metadata:
+                    from .mechanical_metadata import metadata_system_message
 
-        train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=train_batch_size,
-            shuffle=not self.curriculum,
-            collate_fn=collator,
-            num_workers=num_workers,
-            generator=generator,
+                    system_message, _ = metadata_system_message(
+                        record["user_prompt"], tokenizer
+                    )
+                example = build_weighted_example(
+                    record,
+                    tokenizer,
+                    max_length=max_length,
+                    ordinary_weight=ordinary_weight,
+                    sequence_weight=sequence_weight,
+                    span_weight=span_weight,
+                    system_message=system_message,
+                )
+                audit = example.pop("weighting_audit")
+                for name in totals:
+                    totals[name] += int(audit[name])
+                for rule_id in audit["coverage"]["fallback_rules"]:
+                    fallback_rules[rule_id] = fallback_rules.get(rule_id, 0) + 1
+                examples.append(example)
+            if not examples:
+                raise ValueError(f"No records found for the '{split}' split.")
+            summary = {
+                **totals,
+                "span_fallback_rules": dict(sorted(fallback_rules.items())),
+                "examples": len(examples),
+            }
+            self.constraint_weight_audit[split] = summary
+            print(f"Constraint weights for {split}: {summary}")
+            return HFDataset.from_list(examples)
+
+        return build("train"), build("validation")
+
+    def load(self, processor):
+        """Return formatted Hugging Face training and validation datasets."""
+        return (
+            self._format_hf_text_dataset(self.train_dataset, processor),
+            self._format_hf_text_dataset(self.val_dataset, processor),
         )
-        val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=val_batch_size,
-            shuffle=False,
-            collate_fn=collator,
-            num_workers=num_workers,
-        )
-
-        return train_loader, val_loader

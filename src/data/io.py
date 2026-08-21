@@ -1,5 +1,3 @@
-"""Small JSON/JSONL helpers shared by training and dataset-building scripts."""
-
 import json
 from pathlib import Path
 
